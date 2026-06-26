@@ -103,16 +103,13 @@ def build_stream_batches(clean_loader, corruption_loader, ratio, order,
     if order == "shuffle":
         plan = (rng.random(n_steps) < ratio)
     elif order == "block":
-        # alternating clean-block / corrupt-block sized to honor ratio
+        # SUSTAINED corruption: start clean, then one contiguous corrupt run at the
+        # end, sized by ratio. This makes a real drift/persistence signal (the whole
+        # point of 'block') and keeps the stream's start clean so PERSIST's baseline
+        # is valid. e.g. ratio 0.5, n=8 -> ....CCCC ; ratio 0.25 -> ......CC
         plan = np.zeros(n_steps, dtype=bool)
-        block = max(1, n_steps // 6)
-        t = 0
-        toggle = False
-        while t < n_steps:
-            length = block if not toggle else max(1, int(block * ratio / max(1e-9, 1 - ratio)))
-            plan[t:t + length] = toggle
-            t += length
-            toggle = not toggle
+        n_corrupt = max(1, int(round(n_steps * ratio)))
+        plan[n_steps - n_corrupt:] = True
     else:
         raise ValueError(order)
 
