@@ -153,19 +153,26 @@ def build_stream_cache(args, hooks, ref, device, dataset_fps):
                     acts.append(feats[args.layer].cpu().numpy())
                 # 5 sequence columns: signed+abs for both drifts, plus PERSIST
                 seq = compute_sequence_axes(acts, ref, mode=args.persist_mode)
-                stream_vectors.append([seq[c] for c in SEQUENCE_AXIS_COLUMNS])
-            arr = np.array(stream_vectors)  # (n_streams, 5)
+                # ALSO compute the 4 point-axis means over the stream's batches, so
+                # point + sequence axes share a sampling unit (per stream) -> enables
+                # a true joint 7-axis covariance (exp0). Stored as extra columns.
+                point_means = [np.mean([SINGLE_BATCH_AXES[a](h, ref).mean() for h in acts])
+                               for a in SINGLE_BATCH_AXES]
+                row = point_means + [seq[c] for c in SEQUENCE_AXIS_COLUMNS]
+                stream_vectors.append(row)
+            arr = np.array(stream_vectors)  # (n_streams, 4 + 5)
+            joint_cols = list(SINGLE_BATCH_AXES) + SEQUENCE_AXIS_COLUMNS
             save_cache(arr, f"stream_{corruption}_{order}", args.out, meta=dict(
                 source="real", backbone=args.arch, layer=args.layer,
                 dataset=f"cifar10c:{corruption}@sev{args.severity}",
                 dataset_fp=dataset_fps.get("cifar10c"),
-                axis_formulas={"columns": SEQUENCE_AXIS_COLUMNS,
+                axis_formulas={"columns": joint_cols,
                                "persist_mode": args.persist_mode,
-                               "note": "signed+abs drift forms stored; sign TBD from data"},
-                notes=f"sequence axes (5 cols); order={order}, ratio={args.ratio}, "
+                               "note": "point-axis means + signed/abs sequence axes; "
+                                       "9 cols on one sampling unit -> joint 7-axis exp0"},
+                notes=f"joint axes (9 cols); order={order}, ratio={args.ratio}, "
                       f"stream_len={args.stream_len}, persist_mode={args.persist_mode}"))
-            print(f"  stream_{corruption}_{order}: {arr.shape} -> saved "
-                  f"[{', '.join(SEQUENCE_AXIS_COLUMNS)}]")
+            print(f"  stream_{corruption}_{order}: {arr.shape} -> saved (4 point + 5 seq)")
 
     # --- RAMP-SEVERITY streams: gradual drift (the proper DRIFT_COH/CLUST_DRIFT test) ---
     if args.ramp:
@@ -187,18 +194,21 @@ def build_stream_cache(args, hooks, ref, device, dataset_fps):
                         feats, _ = hooks.forward(x.to(device))
                         acts.append(feats[args.layer].cpu().numpy())
                     seq = compute_sequence_axes(acts, ref, mode=args.persist_mode)
-                    stream_vectors.append([seq[c] for c in SEQUENCE_AXIS_COLUMNS])
+                    point_means = [np.mean([SINGLE_BATCH_AXES[a](h, ref).mean() for h in acts])
+                                   for a in SINGLE_BATCH_AXES]
+                    stream_vectors.append(point_means + [seq[c] for c in SEQUENCE_AXIS_COLUMNS])
                 arr = np.array(stream_vectors)
+                joint_cols = list(SINGLE_BATCH_AXES) + SEQUENCE_AXIS_COLUMNS
                 save_cache(arr, f"ramp_{corruption}_{schedule}", args.out, meta=dict(
                     source="real", backbone=args.arch, layer=args.layer,
                     dataset=f"cifar10c:{corruption}@ramp1-5",
                     dataset_fp=dataset_fps.get("cifar10c"),
-                    axis_formulas={"columns": SEQUENCE_AXIS_COLUMNS,
+                    axis_formulas={"columns": joint_cols,
                                    "persist_mode": args.persist_mode,
                                    "schedule": schedule},
-                    notes=f"RAMP severity 1->5 ({schedule}); gradual drift test for "
-                          f"DRIFT_COH/CLUST_DRIFT; stream_len={args.stream_len}"))
-                print(f"  ramp_{corruption}_{schedule}: {arr.shape} -> saved")
+                    notes=f"joint axes (9 cols) RAMP {schedule}; gradual drift; "
+                          f"stream_len={args.stream_len}"))
+                print(f"  ramp_{corruption}_{schedule}: {arr.shape} -> saved (4 point + 5 seq)")
 
 
 def main(args):
