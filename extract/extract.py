@@ -124,7 +124,7 @@ def build_diagnostic_dump(args, hooks, ref, device, dataset_fps):
                                 corruption=corruption, severity=args.severity)
             dump(ld, f"diag_{corruption}", f"cifar10c:{corruption}@sev{args.severity}")
     # near-OOD too if present
-    for ds in ["cifar100"]:
+    for ds in ["cifar100", "isun"]:
         try:
             ld, _ = make_loader(args.volume, ds, tf, args.batch, args.download)
             dump(ld, f"diag_{ds}", ds)
