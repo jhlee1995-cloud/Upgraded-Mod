@@ -126,6 +126,37 @@ def _cycle(loader):
             yield b
 
 
+def build_ramp_stream(severity_loaders, n_steps, schedule="linear"):
+    """GRADUAL drift stream: severity ramps over the stream (1->5), the proper
+    stimulus for DRIFT_COH/CLUST_DRIFT (sustained on/off corruption is NOT gradual).
+
+    severity_loaders: dict {severity:int -> DataLoader} for one corruption.
+    schedule: 'linear' (even severity progression) or 'late' (clean-ish then ramp).
+    Returns LIST of (batch_tensor, severity) so the extractor can run the hook.
+    """
+    sevs = sorted(severity_loaders.keys())          # e.g. [1,2,3,4,5]
+    iters = {s: _cycle(severity_loaders[s]) for s in sevs}
+    # map each step to a severity along the ramp
+    if schedule == "linear":
+        # spread severities evenly across steps: step t -> sevs[floor(t/n * len)]
+        idx = np.minimum((np.arange(n_steps) * len(sevs) // n_steps), len(sevs) - 1)
+    elif schedule == "late":
+        # first half lowest severity, then ramp through the rest
+        half = n_steps // 2
+        idx = np.zeros(n_steps, dtype=int)
+        ramp = np.minimum((np.arange(n_steps - half) * len(sevs) // (n_steps - half)),
+                          len(sevs) - 1)
+        idx[half:] = ramp
+    else:
+        raise ValueError(schedule)
+    stream = []
+    for t in range(n_steps):
+        s = sevs[idx[t]]
+        x, _ = next(iters[s])
+        stream.append((x, s))
+    return stream
+
+
 if __name__ == "__main__":
     import argparse
     import torchvision.transforms as T

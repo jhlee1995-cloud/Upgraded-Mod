@@ -33,7 +33,7 @@ from axis_registry import (AxisRef, SINGLE_BATCH_AXES, SEQUENCE_AXES,
 from cache_audit import save_cache
 from populate_data import resolve_path, sha256_of_dir, DATASETS_SUBDIR
 from data_loaders import (CIFAR10C, ImageFolderFlat, CIFAR10C_CORRUPTIONS,
-                          build_stream_batches, _cycle)
+                          build_stream_batches, build_ramp_stream, _cycle)
 
 
 AXIS_FORMULAS = {
@@ -167,6 +167,39 @@ def build_stream_cache(args, hooks, ref, device, dataset_fps):
             print(f"  stream_{corruption}_{order}: {arr.shape} -> saved "
                   f"[{', '.join(SEQUENCE_AXIS_COLUMNS)}]")
 
+    # --- RAMP-SEVERITY streams: gradual drift (the proper DRIFT_COH/CLUST_DRIFT test) ---
+    if args.ramp:
+        print("\n  [ramp streams] gradual severity 1->5 drift "
+              "(proper stimulus for DRIFT_COH/CLUST_DRIFT):")
+        for corruption in args.stream_corruptions:
+            # one loader per severity for this corruption
+            sev_loaders = {}
+            for sev in range(1, 6):
+                ld, _ = make_loader(args.volume, "cifar10c", tf, args.batch,
+                                    args.download, corruption=corruption, severity=sev)
+                sev_loaders[sev] = ld
+            for schedule in ("linear", "late"):
+                stream_vectors = []
+                for s in range(args.n_streams):
+                    plan = build_ramp_stream(sev_loaders, args.stream_len, schedule=schedule)
+                    acts = []
+                    for x, _sev in plan:
+                        feats, _ = hooks.forward(x.to(device))
+                        acts.append(feats[args.layer].cpu().numpy())
+                    seq = compute_sequence_axes(acts, ref, mode=args.persist_mode)
+                    stream_vectors.append([seq[c] for c in SEQUENCE_AXIS_COLUMNS])
+                arr = np.array(stream_vectors)
+                save_cache(arr, f"ramp_{corruption}_{schedule}", args.out, meta=dict(
+                    source="real", backbone=args.arch, layer=args.layer,
+                    dataset=f"cifar10c:{corruption}@ramp1-5",
+                    dataset_fp=dataset_fps.get("cifar10c"),
+                    axis_formulas={"columns": SEQUENCE_AXIS_COLUMNS,
+                                   "persist_mode": args.persist_mode,
+                                   "schedule": schedule},
+                    notes=f"RAMP severity 1->5 ({schedule}); gradual drift test for "
+                          f"DRIFT_COH/CLUST_DRIFT; stream_len={args.stream_len}"))
+                print(f"  ramp_{corruption}_{schedule}: {arr.shape} -> saved")
+
 
 def main(args):
     device = args.device
@@ -223,6 +256,8 @@ if __name__ == "__main__":
     ap.add_argument("--test-batches", type=int, default=40)
     ap.add_argument("--isun", action="store_true", help="include iSUN near-OOD in point cache")
     ap.add_argument("--cifar10c", action="store_true", help="extract sequence axes from CIFAR-10-C streams")
+    ap.add_argument("--ramp", action="store_true",
+                    help="also extract ramp-severity streams (gradual drift; proper DRIFT_COH/CLUST_DRIFT test)")
     ap.add_argument("--stream-corruptions", nargs="*",
                     default=["fog", "gaussian_noise", "motion_blur"],
                     help="which CIFAR-10-C corruptions to stream")
