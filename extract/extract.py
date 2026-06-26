@@ -86,6 +86,52 @@ def extract_layer_acts(hooks, loader, layer, device, n_batches, keep_labels=True
     return np.concatenate(acts), np.concatenate(labels)
 
 
+def build_diagnostic_dump(args, hooks, ref, device, dataset_fps):
+    """Per-batch point-axis vectors for CLEAN and each corruption SEPARATELY.
+    Enables within-group correlation (clean-only, corruption-only) which removes
+    the clean-corrupt common mode that inflates correlations in mixed streams.
+    This is the test for whether the structure axes are truly redundant or co-quiet."""
+    if not args.diag:
+        return
+    print("\n[diagnostic dump] per-batch axes, clean + per-corruption (for common-mode test):")
+    tf = cifar_transform()
+    axis_order = list(SINGLE_BATCH_AXES)
+
+    def dump(loader, name, ds_label):
+        vectors = []
+        seen = 0
+        for x, y in loader:
+            feats, _ = hooks.forward(x.to(device))
+            X = feats[args.layer].cpu().numpy()
+            vectors.append([SINGLE_BATCH_AXES[a](X, ref).mean() for a in axis_order])
+            seen += 1
+            if seen >= args.diag_batches:
+                break
+        arr = np.array(vectors)
+        save_cache(arr, name, args.out, meta=dict(
+            source="real", backbone=args.arch, layer=args.layer, dataset=ds_label,
+            axis_formulas={"columns": axis_order},
+            notes=f"per-batch point axes for {ds_label} (diagnostic, common-mode test)"))
+        print(f"  {name}: {arr.shape} -> saved")
+
+    # clean
+    clean_loader, _ = make_loader(args.volume, "cifar10", tf, args.batch, args.download)
+    dump(clean_loader, "diag_clean", "cifar10")
+    # each corruption at the chosen severity
+    if args.cifar10c:
+        for corruption in args.stream_corruptions:
+            ld, _ = make_loader(args.volume, "cifar10c", tf, args.batch, args.download,
+                                corruption=corruption, severity=args.severity)
+            dump(ld, f"diag_{corruption}", f"cifar10c:{corruption}@sev{args.severity}")
+    # near-OOD too if present
+    for ds in ["cifar100"]:
+        try:
+            ld, _ = make_loader(args.volume, ds, tf, args.batch, args.download)
+            dump(ld, f"diag_{ds}", ds)
+        except Exception as e:
+            print(f"  diag_{ds} skipped: {repr(e)[:60]}")
+
+
 def build_point_cache(args, hooks, ref, datasets, device, dataset_fps):
     """For each dataset: single-batch axes -> (N_batches, 4) point vectors.
     One vector per BATCH (axes are batch-level statistics)."""
@@ -246,6 +292,9 @@ def main(args):
         point_datasets.append("isun")
     build_point_cache(args, hooks, ref, point_datasets, device, dataset_fps)
 
+    # 2b) diagnostic per-batch dump (clean + per-corruption) for common-mode test
+    build_diagnostic_dump(args, hooks, ref, device, dataset_fps)
+
     # 3) stream caches for sequence axes (need CIFAR-10-C)
     build_stream_cache(args, hooks, ref, device, dataset_fps)
 
@@ -268,6 +317,9 @@ if __name__ == "__main__":
     ap.add_argument("--cifar10c", action="store_true", help="extract sequence axes from CIFAR-10-C streams")
     ap.add_argument("--ramp", action="store_true",
                     help="also extract ramp-severity streams (gradual drift; proper DRIFT_COH/CLUST_DRIFT test)")
+    ap.add_argument("--diag", action="store_true",
+                    help="dump per-batch axes for clean + each corruption (common-mode test)")
+    ap.add_argument("--diag-batches", type=int, default=60, help="batches per diagnostic dump")
     ap.add_argument("--stream-corruptions", nargs="*",
                     default=["fog", "gaussian_noise", "motion_blur"],
                     help="which CIFAR-10-C corruptions to stream")
