@@ -110,8 +110,47 @@ def subnet_consensus(X, ref):
 # ============================================================
 # SEQUENCE AXES  f(stream, ref) -> scalar
 # ============================================================
-def drift_coh(stream, ref, w=2):
-    """window_cosine: coherence of windowed-average mean-pushes (noise-robust)."""
+# ============================================================
+# AGGREGATE ANOMALY -- the per-batch scalar that PERSIST/DRIFT_COH ride on.
+# Real-data finding: corruption LOWERS energy but RAISES distance, so the
+# temporal axes must track an anomaly signal that actually moves with disturbance.
+# Default = mean per-subnet nearest-center distance (validated: PERSIST(distance)
+# caught sustained corruption 0.50 while PERSIST(energy)=0.00). Parameterized so it
+# can later become a multi-axis or conformal-gate aggregate.
+# ============================================================
+def aggregate_anomaly(X, ref, mode="distance"):
+    """Per-batch scalar anomaly. mode='distance' (validated default),
+    'structure' (mean of the 3 structure axes), or 'energy' (legacy)."""
+    if mode == "distance":
+        return float(ref.per_subnet_nearest(X).mean())
+    if mode == "structure":
+        d = ref.per_subnet_nearest(X).mean()
+        c = consensus(X, ref).mean()
+        s = subnet_consensus(X, ref).mean()
+        return float((d + c + s) / 3.0)
+    if mode == "energy":
+        return float((X ** 2).mean() / ref.energy_mean - 1.0)
+    raise ValueError(mode)
+
+
+# ============================================================
+# SEQUENCE AXES -- each returns BOTH signed and absolute forms.
+# Sign convention is unresolved on real data (CLUST_DRIFT came out NEGATIVE;
+# "drift-coherence sign flips between domains"). Store both -> decide from data,
+# one extraction instead of re-running after guessing the sign.
+# ============================================================
+def _coherence_pairs(vecs):
+    """mean cosine of consecutive unit changes of a (T, D) trajectory.
+    Returns the signed mean; caller takes abs if wanted."""
+    ch = np.diff(vecs, axis=0)
+    cn = ch / (np.linalg.norm(ch, axis=1, keepdims=True) + 1e-9)
+    if len(cn) < 2:
+        return 0.0
+    return float(np.mean([np.dot(cn[i], cn[i + 1]) for i in range(len(cn) - 1)]))
+
+
+def drift_coh(stream, ref, w=2, signed=True):
+    """window_cosine of mean-push directions (noise-robust). signed or absolute."""
     means = np.array([h.mean(0) for h in stream])
     if len(means) < 2 * w + 1:
         push = np.diff(means, axis=0)
@@ -121,26 +160,49 @@ def drift_coh(stream, ref, w=2):
     pn = push / (np.linalg.norm(push, axis=1, keepdims=True) + 1e-9)
     if len(pn) < 2:
         return 0.0
-    return float(np.mean([np.dot(pn[i], pn[i + 1]) for i in range(len(pn) - 1)]))
+    val = float(np.mean([np.dot(pn[i], pn[i + 1]) for i in range(len(pn) - 1)]))
+    return val if signed else abs(val)
 
-def persist(stream, ref, thr=0.5):
-    """streak: longest consecutive run of above-threshold energy deviation / T."""
-    devs = np.array([(h ** 2).mean() / ref.energy_mean - 1.0 for h in stream])
-    over = devs > thr
+
+def persist(stream, ref, mode="distance", k=2.0):
+    """streak of consecutive ABOVE-BASELINE aggregate-anomaly batches / T.
+    Re-based on aggregate_anomaly (not energy): threshold = baseline mean + k*std
+    estimated from the first few batches (assumed cleaner). Real-data validated:
+    distance-based catches sustained corruption where energy-based gives 0."""
+    a = np.array([aggregate_anomaly(h, ref, mode=mode) for h in stream])
+    n_base = max(2, len(a) // 3)
+    base = a[:n_base].mean() + k * (a[:n_base].std() + 1e-9)
+    over = a > base
     best = cur = 0
     for o in over:
         cur = cur + 1 if o else 0
         best = max(best, cur)
     return float(best / len(stream))
 
-def clust_drift(stream, ref):
-    """consec_cosine: coherence of consecutive distance-vector changes."""
+
+def clust_drift(stream, ref, signed=True):
+    """consec_cosine of distance-VECTOR changes (K-dim). signed or absolute.
+    Real-data: came out negative (distance-vector zig-zags) -> store both forms."""
     dv = np.array([ref.dist_vector(h) for h in stream])
-    ch = np.diff(dv, axis=0)
-    cn = ch / (np.linalg.norm(ch, axis=1, keepdims=True) + 1e-9)
-    if len(cn) < 2:
-        return 0.0
-    return float(np.mean([np.dot(cn[i], cn[i + 1]) for i in range(len(cn) - 1)]))
+    val = _coherence_pairs(dv)
+    return val if signed else abs(val)
+
+
+def compute_sequence_axes(stream, ref, mode="distance"):
+    """Compute all sequence axes returning BOTH signed and absolute drift forms.
+    Returns an ordered dict matching SEQUENCE_AXIS_COLUMNS below."""
+    return {
+        "DRIFT_COH_signed": drift_coh(stream, ref, signed=True),
+        "DRIFT_COH_abs":    drift_coh(stream, ref, signed=False),
+        "PERSIST":          persist(stream, ref, mode=mode),
+        "CLUST_DRIFT_signed": clust_drift(stream, ref, signed=True),
+        "CLUST_DRIFT_abs":    clust_drift(stream, ref, signed=False),
+    }
+
+
+SEQUENCE_AXIS_COLUMNS = ["DRIFT_COH_signed", "DRIFT_COH_abs", "PERSIST",
+                         "CLUST_DRIFT_signed", "CLUST_DRIFT_abs"]
+
 
 
 SINGLE_BATCH_AXES = {
@@ -149,12 +211,14 @@ SINGLE_BATCH_AXES = {
     "CLUSTER_DISTANCE": cluster_distance,
     "SUBNET_CONSENSUS": subnet_consensus,
 }
+# sequence axes are computed together via compute_sequence_axes (returns signed+abs
+# drift forms); the individual fns remain for direct use/testing
 SEQUENCE_AXES = {
     "DRIFT_COH": drift_coh,
     "PERSIST": persist,
     "CLUST_DRIFT": clust_drift,
 }
-ALL_AXES = list(SINGLE_BATCH_AXES) + list(SEQUENCE_AXES)
+ALL_AXES = list(SINGLE_BATCH_AXES) + SEQUENCE_AXIS_COLUMNS
 
 
 if __name__ == "__main__":
@@ -171,12 +235,10 @@ if __name__ == "__main__":
     # sequence axes need a stream
     from synth_streams import generate_streams
     streams, c2 = generate_streams(n_streams=2)
-    ref2 = AxisRef(np.vstack([b for s in streams['clean'] for b in s]),
-                   np.zeros(sum(len(b) for s in streams['clean'] for b in s), dtype=int)
-                   if False else
-                   __import__('numpy').linalg.norm(
-                       np.vstack([b for s in streams['clean'] for b in s])[:, None] - c2[None], axis=2).argmin(1),
-                   n_classes=10)
-    for name, fn in SEQUENCE_AXES.items():
-        v = fn(streams['clean'][0], ref2)
-        print(f"  {name:18s}: scalar {v:.3f}")
+    allb = np.vstack([b for s in streams['clean'] for b in s])
+    pseudo = np.linalg.norm(allb[:, None] - c2[None], axis=2).argmin(1)
+    ref2 = AxisRef(allb, pseudo, n_classes=10)
+    print("sequence axes (signed + abs forms):")
+    seq = compute_sequence_axes(streams['clean'][0], ref2)
+    for name, v in seq.items():
+        print(f"  {name:20s}: {v:.3f}")

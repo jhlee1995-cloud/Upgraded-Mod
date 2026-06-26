@@ -28,7 +28,8 @@ import torchvision.transforms as T
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from backbone import load_backbone, MultiLayerHooks
-from axis_registry import AxisRef, SINGLE_BATCH_AXES, SEQUENCE_AXES
+from axis_registry import (AxisRef, SINGLE_BATCH_AXES, SEQUENCE_AXES,
+                           compute_sequence_axes, SEQUENCE_AXIS_COLUMNS)
 from cache_audit import save_cache
 from populate_data import resolve_path, sha256_of_dir, DATASETS_SUBDIR
 from data_loaders import (CIFAR10C, ImageFolderFlat, CIFAR10C_CORRUPTIONS,
@@ -135,7 +136,6 @@ def build_stream_cache(args, hooks, ref, device, dataset_fps):
     tf = cifar_transform()
     clean_loader, _ = make_loader(args.volume, "cifar10", tf, args.batch, args.download)
 
-    seq_order = list(SEQUENCE_AXES)
     for corruption in args.stream_corruptions:
         corr_loader, _ = make_loader(args.volume, "cifar10c", tf, args.batch,
                                      args.download, corruption=corruption,
@@ -151,18 +151,21 @@ def build_stream_cache(args, hooks, ref, device, dataset_fps):
                 for x, _is_corrupt in plan:
                     feats, _ = hooks.forward(x.to(device))
                     acts.append(feats[args.layer].cpu().numpy())
-                # compute the 3 sequence axes on this stream
-                vec = [SEQUENCE_AXES[a](acts, ref) for a in seq_order]
-                stream_vectors.append(vec)
-            arr = np.array(stream_vectors)  # (n_streams, 3)
+                # 5 sequence columns: signed+abs for both drifts, plus PERSIST
+                seq = compute_sequence_axes(acts, ref, mode=args.persist_mode)
+                stream_vectors.append([seq[c] for c in SEQUENCE_AXIS_COLUMNS])
+            arr = np.array(stream_vectors)  # (n_streams, 5)
             save_cache(arr, f"stream_{corruption}_{order}", args.out, meta=dict(
                 source="real", backbone=args.arch, layer=args.layer,
                 dataset=f"cifar10c:{corruption}@sev{args.severity}",
                 dataset_fp=dataset_fps.get("cifar10c"),
-                axis_formulas={a: AXIS_FORMULAS[a] for a in seq_order},
-                notes=f"sequence axes; order={order}, ratio={args.ratio}, "
-                      f"stream_len={args.stream_len}"))
-            print(f"  stream_{corruption}_{order}: {arr.shape} -> saved")
+                axis_formulas={"columns": SEQUENCE_AXIS_COLUMNS,
+                               "persist_mode": args.persist_mode,
+                               "note": "signed+abs drift forms stored; sign TBD from data"},
+                notes=f"sequence axes (5 cols); order={order}, ratio={args.ratio}, "
+                      f"stream_len={args.stream_len}, persist_mode={args.persist_mode}"))
+            print(f"  stream_{corruption}_{order}: {arr.shape} -> saved "
+                  f"[{', '.join(SEQUENCE_AXIS_COLUMNS)}]")
 
 
 def main(args):
@@ -224,6 +227,9 @@ if __name__ == "__main__":
                     default=["fog", "gaussian_noise", "motion_blur"],
                     help="which CIFAR-10-C corruptions to stream")
     ap.add_argument("--severity", type=int, default=3, help="CIFAR-10-C severity for streams")
+    ap.add_argument("--persist-mode", default="distance",
+                    choices=["distance", "structure", "energy"],
+                    help="aggregate-anomaly basis for PERSIST (distance validated; energy=legacy/blind)")
     ap.add_argument("--ratio", type=float, default=0.3, help="corruption fraction in streams")
     ap.add_argument("--n-streams", type=int, default=40, help="streams per (corruption,order)")
     ap.add_argument("--stream-len", type=int, default=8, help="batches per stream (T)")
