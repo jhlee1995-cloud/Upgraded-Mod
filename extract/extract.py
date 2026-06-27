@@ -443,6 +443,9 @@ def build_stream_cache(args, hooks, ref, device, dataset_fps):
                 axis_formulas={"columns": joint_cols, "persist_mode": args.persist_mode},
                 notes=f"joint axes (9 cols) RECOVERY up-down; row9; stream_len={args.stream_len}"))
             print(f"  recovery_{corruption}: {arr.shape} -> saved (4 point + 5 seq)")
+
+
+def main(args):
     device = args.device
     os.makedirs(args.out, exist_ok=True)
     model, src = load_backbone(args.arch, device)
