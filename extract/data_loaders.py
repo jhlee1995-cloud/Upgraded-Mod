@@ -126,7 +126,32 @@ def _cycle(loader):
             yield b
 
 
-def build_ramp_stream(severity_loaders, n_steps, schedule="linear"):
+def build_recovery_stream(severity_loaders, clean_loader, n_steps, peak_frac=0.5):
+    """RECOVERY: severity ramps UP to a peak then back DOWN to clean (drift returning).
+    Map row 9. Tests whether any axis reads the DIRECTION (worsening vs recovering) --
+    critical for adapt-stop. Returns list of (x, sev).
+
+    Built as an explicit symmetric triangle over levels [0,1,2,3,4,5,4,3,2,1,0] so EVERY
+    severity appears on the way up AND down (0 = clean). The triangle is resampled to
+    n_steps. e.g. n=12 -> 0 1 2 3 4 5 5 4 3 2 1 0 (no skipped levels)."""
+    sevs = sorted(severity_loaders.keys())          # [1..5]
+    iters = {s: _cycle(severity_loaders[s]) for s in sevs}
+    clean_it = _cycle(clean_loader)
+    # canonical triangle of LEVELS including 0 (clean) at both ends
+    up = list(range(0, len(sevs) + 1))              # 0,1,2,3,4,5
+    down = list(range(len(sevs) - 1, -1, -1))       # 4,3,2,1,0
+    tri = up + down                                  # 0..5..0, length 2*len(sevs)
+    # resample triangle to n_steps (nearest)
+    plan = []
+    for t in range(n_steps):
+        lvl = tri[int(round(t * (len(tri) - 1) / max(1, n_steps - 1)))]
+        if lvl == 0:
+            x, _ = next(clean_it)
+            plan.append((x, 0))
+        else:
+            x, _ = next(iters[sevs[lvl - 1]])        # level 1 -> sevs[0]
+            plan.append((x, lvl))
+    return plan
     """GRADUAL drift stream: severity ramps over the stream (1->5), the proper
     stimulus for DRIFT_COH/CLUST_DRIFT (sustained on/off corruption is NOT gradual).
 

@@ -75,6 +75,39 @@ class AxisRef:
             P[:, g] = e / e.sum(1, keepdims=True)
         return P
 
+    def per_subnet_all_dists(self, X):
+        """(B, G, n_classes) normalized distances to ALL centers per subnet.
+        The raw material for valley geometry (margin, entropy)."""
+        out = np.zeros((X.shape[0], self.G, self.n_classes))
+        for g in range(self.G):
+            sl = slice(g * self.GS, (g + 1) * self.GS)
+            d = np.linalg.norm(X[:, sl][:, None] - self.subnet_centers[g][None], axis=2)
+            out[:, g] = d / self.subnet_scale[g]
+        return out
+
+    def valley_margin(self, X):
+        """Per-subnet (nearest - second_nearest) distance, averaged over subnets.
+        SMALL margin = sits BETWEEN two clusters (on a ridge / in the valley between
+        them) = type-a-like. LARGE margin = deep in ONE cluster (could be the WRONG
+        one = type-b). This is the 'how stuck in the valley between clusters' measure."""
+        D = self.per_subnet_all_dists(X)             # (B, G, C)
+        Ds = np.sort(D, axis=2)                       # ascending
+        margin = Ds[:, :, 1] - Ds[:, :, 0]            # second - nearest >= 0
+        return margin.mean(1)                         # (B,)
+
+    def valley_entropy(self, X, temp=1.0):
+        """Entropy of the softmax over (negative) distances to all centers, averaged
+        over subnets. HIGH entropy = flat = ambiguous across many clusters (valley/ridge,
+        type-a). LOW entropy = peaked on one cluster (deep valley; right OR wrong = type-b
+        if wrong). Complements margin: margin is top-2, entropy is whole distribution."""
+        D = self.per_subnet_all_dists(X)             # (B, G, C)
+        lg = -D / temp
+        lg -= lg.max(2, keepdims=True)
+        e = np.exp(lg)
+        p = e / e.sum(2, keepdims=True)
+        ent = -(p * np.log(p + 1e-12)).sum(2)        # (B, G)
+        return ent.mean(1)                            # (B,)
+
     def dist_vector(self, X):
         return self.per_subnet_nearest(X).mean(0)
 
@@ -96,9 +129,52 @@ def consensus(X, ref):
             score += (v[:, g1] != v[:, g2]); pairs += 1
     return score / pairs
 
+def _takens(x, tau=1, dim=3):
+    """delay embedding of a 1D signal: x(t) -> [x(t), x(t-tau), ..., x(t-(dim-1)tau)]."""
+    n = len(x) - (dim - 1) * tau
+    if n < 2:
+        return None
+    return np.array([[x[i + k * tau] for k in range(dim)] for i in range(n)])
+
+
+def traj_loop(stream, ref, tau=1, dim=3):
+    """TRAJ_LOOP: total H1 (loop) persistence of the Takens-embedded cluster-distance
+    trajectory. The per-batch mean nearest-center distance is a noise-robust 1D signal.
+
+    What it actually measures (validated synthetic): NON-MONOTONE trajectory structure.
+    Monotone trajectories (drift, sustained-step) give H1=0.000; non-monotone ones give
+    H1>0 -- recovery (orderly out-and-back) 0.08, shuffle (disordered up/down) 0.24. It
+    does NOT isolate recovery from shuffle by magnitude alone, but it cleanly separates
+    BOTH from monotone drift/sustained. This is GLOBAL structure that DRIFT_COH (a LOCAL
+    direction-coherence measure) is blind to: DRIFT_COH reads recovery and shuffle both as
+    'incoherent' and can't distinguish them from each other OR flag the return.
+    Returns 0.0 if ripser is unavailable (optional dependency)."""
+    try:
+        from ripser import ripser
+    except ImportError:
+        return 0.0
+    sig = np.array([ref.per_subnet_nearest(h).mean() for h in stream])  # cluster-dist (T,)
+    emb = _takens(sig, tau=tau, dim=dim)
+    if emb is None or len(emb) < 3:
+        return 0.0
+    h1 = ripser(emb, maxdim=1)['dgms'][1]
+    return float(sum(d - b for b, d in h1 if np.isfinite(d)))
+
+
 def cluster_distance(X, ref):
     """mean_nearest: mean per-subnet nearest-center distance. Sole (partial) type-b channel."""
     return ref.per_subnet_nearest(X).mean(1)
+
+def valley_margin(X, ref):
+    """nearest minus second-nearest center distance (how deep in ONE valley vs on a
+    ridge between two). Candidate variant: small=between-cluster(type-a), large=in one
+    cluster (right or wrong=type-b)."""
+    return ref.valley_margin(X)
+
+def valley_entropy(X, ref):
+    """entropy of distance-softmax over centers (flat=ambiguous/type-a, peaked=one
+    valley). Candidate variant complementary to margin."""
+    return ref.valley_entropy(X)
 
 def subnet_consensus(X, ref):
     """mean_entropy: mean per-subnet soft entropy. Complementary to hard consensus."""
@@ -197,11 +273,12 @@ def compute_sequence_axes(stream, ref, mode="distance"):
         "PERSIST":          persist(stream, ref, mode=mode),
         "CLUST_DRIFT_signed": clust_drift(stream, ref, signed=True),
         "CLUST_DRIFT_abs":    clust_drift(stream, ref, signed=False),
+        "TRAJ_LOOP":        traj_loop(stream, ref),
     }
 
 
 SEQUENCE_AXIS_COLUMNS = ["DRIFT_COH_signed", "DRIFT_COH_abs", "PERSIST",
-                         "CLUST_DRIFT_signed", "CLUST_DRIFT_abs"]
+                         "CLUST_DRIFT_signed", "CLUST_DRIFT_abs", "TRAJ_LOOP"]
 
 
 

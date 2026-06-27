@@ -9,3 +9,5 @@ pillow>=9.0
 # Stage B (frame/topology) + analysis
 scipy>=1.10
 matplotlib>=3.7
+ripser
+persim

@@ -33,7 +33,8 @@ from axis_registry import (AxisRef, SINGLE_BATCH_AXES, SEQUENCE_AXES,
 from cache_audit import save_cache
 from populate_data import resolve_path, sha256_of_dir, DATASETS_SUBDIR
 from data_loaders import (CIFAR10C, ImageFolderFlat, CIFAR10C_CORRUPTIONS,
-                          build_stream_batches, build_ramp_stream, _cycle)
+                          build_stream_batches, build_ramp_stream,
+                          build_recovery_stream, _cycle)
 
 
 AXIS_FORMULAS = {
@@ -86,6 +87,148 @@ def extract_layer_acts(hooks, loader, layer, device, n_batches, keep_labels=True
     return np.concatenate(acts), np.concatenate(labels)
 
 
+def build_cluster_structure_dump(args, hooks, ref, device, dataset_fps):
+    """Does penult space even HAVE valleys? Dump the raw geometry to find out:
+      - per-class centers + within-class spread + between-class distances (separation)
+      - per-class covariance eigenvalues (sphere vs elongated -> mean_nearest vs mahalanobis)
+      - 2D PCA projection of clean samples (+ type-b) for visual valley inspection
+      - where misclassified (type-b) samples land relative to the valleys
+    Saves npy arrays under <out>/structure/ for structure_geometry.py."""
+    if not args.cluster_struct:
+        return
+    print("\n[cluster structure] probing penult geometry (do valleys exist?):")
+    import torch.nn.functional as F
+    tf = cifar_transform()
+    loader, _ = make_loader(args.volume, "cifar10", tf, args.batch, args.download)
+
+    feats_all, labels_all, preds_all, conf_all = [], [], [], []
+    seen = 0
+    for x, y in loader:
+        x = x.to(device)
+        f, logits = hooks.forward(x)
+        feats_all.append(f[args.layer].cpu().numpy())
+        probs = F.softmax(logits, dim=1).cpu().numpy()
+        preds_all.append(probs.argmax(1))
+        conf_all.append(probs.max(1))
+        labels_all.append(y.numpy())
+        seen += len(y)
+        if seen >= args.struct_samples:
+            break
+    F_ = np.vstack(feats_all)
+    lab = np.concatenate(labels_all)
+    pred = np.concatenate(preds_all)
+    conf = np.concatenate(conf_all)
+    print(f"  collected {len(F_)} samples ({(pred!=lab).sum()} misclassified)")
+
+    # per-class centers, within spread, covariance eigenvalues
+    nc = ref.n_classes
+    centers = np.zeros((nc, F_.shape[1]))
+    within = np.zeros(nc)
+    eigs = np.zeros((nc, min(F_.shape[1], 10)))  # top-10 cov eigenvalues
+    for c in range(nc):
+        m = lab == c
+        if m.sum() < 2:
+            continue
+        Xc = F_[m]
+        centers[c] = Xc.mean(0)
+        within[c] = np.linalg.norm(Xc - centers[c], axis=1).mean()
+        cov = np.cov(Xc, rowvar=False)
+        ev = np.linalg.eigvalsh(cov)[::-1][:10]
+        eigs[c, :len(ev)] = ev
+
+    # between-class center distances
+    between = np.linalg.norm(centers[:, None] - centers[None], axis=2)
+    np.fill_diagonal(between, np.nan)
+
+    # 2D PCA projection (clean) for visual inspection
+    Fm = F_ - F_.mean(0)
+    U, S, Vt = np.linalg.svd(Fm, full_matrices=False)
+    proj2d = Fm @ Vt[:2].T  # (N, 2)
+
+    # save under structure/
+    sdir = os.path.join(args.out, "structure")
+    os.makedirs(sdir, exist_ok=True)
+    np.savez(os.path.join(sdir, "cluster_geometry.npz"),
+             centers=centers, within=within, between=between, eigs=eigs,
+             proj2d=proj2d, labels=lab, preds=pred, conf=conf,
+             explained_var=(S**2 / (S**2).sum())[:10])
+    print(f"  saved structure/cluster_geometry.npz")
+    print(f"  within-class spread: mean {within.mean():.3f}")
+    print(f"  between-class dist:  mean {np.nanmean(between):.3f}")
+    sep = np.nanmean(between) / (within.mean() + 1e-9)
+    print(f"  separation ratio (between/within): {sep:.2f}  "
+          f"({'valleys exist' if sep > 1.5 else 'clusters overlap -- weak valleys'})")
+
+
+def build_typeb_dump(args, hooks, ref, device, dataset_fps):
+    """TRUE type-b: CIFAR-10 test images the model MISCLASSIFIES. Same distribution
+    (energy-normal by construction) + wrong prediction = type-b by definition. Unlike
+    iSUN (far-OOD, energy drops), these are in-distribution errors. Split into:
+      diag_cifar10_correct  -- correctly classified (the 'clean' reference for type-b)
+      diag_cifar10_wrong    -- all misclassified
+      diag_cifar10_confwrong-- misclassified AND high-confidence (the hardest type-b)
+    Test: does CLUSTER_DISTANCE fire on wrong-but-confident while CONSENSUS stays silent?"""
+    if not args.typeb:
+        return
+    print("\n[type-b dump] CIFAR-10 misclassified samples (true energy-normal type-b):")
+    import torch.nn.functional as F
+    from axis_registry import valley_margin, valley_entropy
+    tf = cifar_transform()
+    loader, _ = make_loader(args.volume, "cifar10", tf, args.batch, args.download)
+    diag_axes = dict(SINGLE_BATCH_AXES)
+    diag_axes["VALLEY_MARGIN"] = valley_margin
+    diag_axes["VALLEY_ENTROPY"] = valley_entropy
+    axis_order = list(diag_axes)
+
+    # collect per-sample: activation, predicted, true, confidence
+    correct_acts, wrong_acts, confwrong_acts = [], [], []
+    n_seen = 0
+    for x, y in loader:
+        x = x.to(device)
+        feats, logits = hooks.forward(x)
+        X = feats[args.layer].cpu().numpy()
+        probs = F.softmax(logits, dim=1).cpu().numpy()
+        pred = probs.argmax(1)
+        conf = probs.max(1)
+        y = y.numpy()
+        for i in range(len(y)):
+            row = X[i:i+1]  # single-sample "batch" (1, C)
+            if pred[i] == y[i]:
+                correct_acts.append(row)
+            else:
+                wrong_acts.append(row)
+                if conf[i] > args.conf_thresh:
+                    confwrong_acts.append(row)
+        n_seen += len(y)
+        if n_seen >= args.typeb_samples:
+            break
+
+    print(f"  scanned {n_seen} samples: {len(correct_acts)} correct, "
+          f"{len(wrong_acts)} wrong, {len(confwrong_acts)} conf-wrong (>{args.conf_thresh})")
+
+    # axes are batch-level; group single samples into pseudo-batches of size args.batch
+    def to_batches(acts, name, label):
+        if len(acts) < args.batch:
+            print(f"  {name}: only {len(acts)} samples (<{args.batch}); skipping")
+            return
+        A = np.vstack(acts)
+        nb = len(A) // args.batch
+        vectors = []
+        for b in range(nb):
+            Xb = A[b*args.batch:(b+1)*args.batch]
+            vectors.append([diag_axes[a](Xb, ref).mean() for a in axis_order])
+        arr = np.array(vectors)
+        save_cache(arr, name, args.out, meta=dict(
+            source="real", backbone=args.arch, layer=args.layer, dataset=label,
+            axis_formulas={"columns": axis_order},
+            notes=f"type-b dump: {label} ({len(A)} samples -> {nb} pseudo-batches)"))
+        print(f"  {name}: {arr.shape} -> saved")
+
+    to_batches(correct_acts, "diag_cifar10_correct", "cifar10-correct")
+    to_batches(wrong_acts, "diag_cifar10_wrong", "cifar10-wrong (type-b)")
+    to_batches(confwrong_acts, "diag_cifar10_confwrong", "cifar10-confwrong (hard type-b)")
+
+
 def build_diagnostic_dump(args, hooks, ref, device, dataset_fps):
     """Per-batch point-axis vectors for CLEAN and each corruption SEPARATELY.
     Enables within-group correlation (clean-only, corruption-only) which removes
@@ -93,9 +236,14 @@ def build_diagnostic_dump(args, hooks, ref, device, dataset_fps):
     This is the test for whether the structure axes are truly redundant or co-quiet."""
     if not args.diag:
         return
-    print("\n[diagnostic dump] per-batch axes, clean + per-corruption (for common-mode test):")
+    print("\n[diagnostic dump] per-batch axes + valley geometry, clean + per-corruption:")
     tf = cifar_transform()
-    axis_order = list(SINGLE_BATCH_AXES)
+    # 4 standard axes + 2 valley-geometry candidates (margin, entropy)
+    from axis_registry import valley_margin, valley_entropy
+    diag_axes = dict(SINGLE_BATCH_AXES)
+    diag_axes["VALLEY_MARGIN"] = valley_margin
+    diag_axes["VALLEY_ENTROPY"] = valley_entropy
+    axis_order = list(diag_axes)
 
     def dump(loader, name, ds_label):
         vectors = []
@@ -103,7 +251,7 @@ def build_diagnostic_dump(args, hooks, ref, device, dataset_fps):
         for x, y in loader:
             feats, _ = hooks.forward(x.to(device))
             X = feats[args.layer].cpu().numpy()
-            vectors.append([SINGLE_BATCH_AXES[a](X, ref).mean() for a in axis_order])
+            vectors.append([diag_axes[a](X, ref).mean() for a in axis_order])
             seen += 1
             if seen >= args.diag_batches:
                 break
@@ -111,7 +259,7 @@ def build_diagnostic_dump(args, hooks, ref, device, dataset_fps):
         save_cache(arr, name, args.out, meta=dict(
             source="real", backbone=args.arch, layer=args.layer, dataset=ds_label,
             axis_formulas={"columns": axis_order},
-            notes=f"per-batch point axes for {ds_label} (diagnostic, common-mode test)"))
+            notes=f"per-batch axes + valley geom for {ds_label} (diagnostic)"))
         print(f"  {name}: {arr.shape} -> saved")
 
     # clean
@@ -123,6 +271,14 @@ def build_diagnostic_dump(args, hooks, ref, device, dataset_fps):
             ld, _ = make_loader(args.volume, "cifar10c", tf, args.batch, args.download,
                                 corruption=corruption, severity=args.severity)
             dump(ld, f"diag_{corruption}", f"cifar10c:{corruption}@sev{args.severity}")
+        # severity sweep: dump severities 1,2,3 to escape the AUC ceiling
+        if args.sev_sweep:
+            print("  [severity sweep] dumping severities 1,2,3 (escape AUC ceiling):")
+            for corruption in args.stream_corruptions:
+                for sev in (1, 2, 3):
+                    ld, _ = make_loader(args.volume, "cifar10c", tf, args.batch,
+                                        args.download, corruption=corruption, severity=sev)
+                    dump(ld, f"diag_{corruption}_s{sev}", f"cifar10c:{corruption}@sev{sev}")
     # near-OOD too if present
     for ds in ["cifar100", "isun"]:
         try:
@@ -256,8 +412,37 @@ def build_stream_cache(args, hooks, ref, device, dataset_fps):
                           f"stream_len={args.stream_len}"))
                 print(f"  ramp_{corruption}_{schedule}: {arr.shape} -> saved (4 point + 5 seq)")
 
-
-def main(args):
+    # --- RECOVERY streams: severity up then back down (map row 9, adapt-stop) ---
+    if args.recovery:
+        print("\n  [recovery streams] severity up->peak->down to clean "
+              "(does any axis read DIRECTION?):")
+        clean_loader, _ = make_loader(args.volume, "cifar10", tf, args.batch, args.download)
+        for corruption in args.stream_corruptions:
+            sev_loaders = {}
+            for sev in range(1, 6):
+                ld, _ = make_loader(args.volume, "cifar10c", tf, args.batch,
+                                    args.download, corruption=corruption, severity=sev)
+                sev_loaders[sev] = ld
+            stream_vectors = []
+            for s in range(args.n_streams):
+                plan = build_recovery_stream(sev_loaders, clean_loader, args.stream_len)
+                acts = []
+                for x, _sev in plan:
+                    feats, _ = hooks.forward(x.to(device))
+                    acts.append(feats[args.layer].cpu().numpy())
+                seq = compute_sequence_axes(acts, ref, mode=args.persist_mode)
+                point_means = [np.mean([SINGLE_BATCH_AXES[a](h, ref).mean() for h in acts])
+                               for a in SINGLE_BATCH_AXES]
+                stream_vectors.append(point_means + [seq[c] for c in SEQUENCE_AXIS_COLUMNS])
+            arr = np.array(stream_vectors)
+            joint_cols = list(SINGLE_BATCH_AXES) + SEQUENCE_AXIS_COLUMNS
+            save_cache(arr, f"recovery_{corruption}", args.out, meta=dict(
+                source="real", backbone=args.arch, layer=args.layer,
+                dataset=f"cifar10c:{corruption}@recovery",
+                dataset_fp=dataset_fps.get("cifar10c"),
+                axis_formulas={"columns": joint_cols, "persist_mode": args.persist_mode},
+                notes=f"joint axes (9 cols) RECOVERY up-down; row9; stream_len={args.stream_len}"))
+            print(f"  recovery_{corruption}: {arr.shape} -> saved (4 point + 5 seq)")
     device = args.device
     os.makedirs(args.out, exist_ok=True)
     model, src = load_backbone(args.arch, device)
@@ -295,6 +480,12 @@ def main(args):
     # 2b) diagnostic per-batch dump (clean + per-corruption) for common-mode test
     build_diagnostic_dump(args, hooks, ref, device, dataset_fps)
 
+    # 2c) TRUE type-b dump (CIFAR-10 misclassified = energy-normal confident-wrong)
+    build_typeb_dump(args, hooks, ref, device, dataset_fps)
+
+    # 2d) cluster-structure probe (do valleys exist? where is type-b?)
+    build_cluster_structure_dump(args, hooks, ref, device, dataset_fps)
+
     # 3) stream caches for sequence axes (need CIFAR-10-C)
     build_stream_cache(args, hooks, ref, device, dataset_fps)
 
@@ -320,6 +511,17 @@ if __name__ == "__main__":
     ap.add_argument("--diag", action="store_true",
                     help="dump per-batch axes for clean + each corruption (common-mode test)")
     ap.add_argument("--diag-batches", type=int, default=60, help="batches per diagnostic dump")
+    ap.add_argument("--typeb", action="store_true",
+                    help="dump CIFAR-10 misclassified samples (true energy-normal type-b)")
+    ap.add_argument("--typeb-samples", type=int, default=10000, help="CIFAR-10 samples to scan for type-b")
+    ap.add_argument("--conf-thresh", type=float, default=0.7, help="confidence threshold for conf-wrong type-b")
+    ap.add_argument("--sev-sweep", action="store_true",
+                    help="dump diag at severities 1,2,3 to escape the AUC ceiling")
+    ap.add_argument("--cluster-struct", action="store_true",
+                    help="probe penult cluster geometry (do valleys exist? where is type-b?)")
+    ap.add_argument("--recovery", action="store_true",
+                    help="recovery streams (severity up then down; map row 9, adapt-stop)")
+    ap.add_argument("--struct-samples", type=int, default=10000, help="samples for cluster-structure probe")
     ap.add_argument("--stream-corruptions", nargs="*",
                     default=["fog", "gaussian_noise", "motion_blur"],
                     help="which CIFAR-10-C corruptions to stream")

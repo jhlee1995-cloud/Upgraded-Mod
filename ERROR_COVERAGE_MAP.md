@@ -1,111 +1,162 @@
 # Error-Coverage Map — Master Tracking Document
 
-**Goal:** fill every cell. Each row is an *error mechanism* (not a dataset — mechanism,
-because that's what determines which axis fires). Each column is a *detection axis*. Each
-cell records whether that axis catches that error, with the evidence.
-
-**Legend:**
-- ✅ = caught, real-data evidence
-- 🟡 = caught on synthetic only (real test pending)
-- ⬜ = no data / not tested yet
-- ✗ = tested, does NOT catch (and that's understood/correct)
-- — = not applicable
-
-**Axes (current pool of 7):**
-DEV=DEVIATION (energy inflation, one-sided) · CON=CONSENSUS (hard-vote disagreement) ·
-CLD=CLUSTER_DISTANCE (nearest-center distance) · SUB=SUBNET_CONSENSUS (soft entropy) ·
-DCH=DRIFT_COH (directional drift) · PER=PERSIST (sustained) · CDR=CLUST_DRIFT (distance-vector drift)
+**Goal:** fill every cell, and keep evidence honestly separated from expectation. Rows are
+*error mechanisms* (mechanism determines which axis fires). Columns are *detection axes*.
+This document is a **decision engine** (see Escalation), not just a record.
 
 ---
 
-## The Map
+## Legend (disambiguated)
 
-| # | error mechanism | example | DEV | CON | CLD | SUB | DCH | PER | CDR | test status |
-|---|-----------------|---------|-----|-----|-----|-----|-----|-----|-----|-------------|
-| 1 | **energy explosion** | sensor glitch, NaN-ish spike | 🟡 | — | — | — | — | — | — | synthetic only; no real stimulus |
-| 2 | **energy decrease** | corruption, near-OOD at penult | ✗ | ✅ | ✅ | ✅ | — | — | — | real (CIFAR-10-C, CIFAR-100) |
-| 3 | **between-cluster (type-a)** | ambiguous input | ✗ | ✅ | 🟡 | ✅ | — | — | — | real corruption ✅; clean type-a ⬜ |
-| 4 | **wrong-cluster (type-b)** | confident-wrong, energy-normal | ✗ | ✗ | ⬜ | ✗ | — | — | — | **NEEDS iSUN** — biggest gap |
-| 5 | **directional gradual drift** | sensor aging, consistent shift | ⬜ | ⬜ | ⬜ | ⬜ | ✅ | ✅ | 🟡→drop | real (gaussian ramp 0.39); CDR covered |
-| 6 | **non-directional gradual drift** | blur increasing | ⬜ | ⬜ | ⬜ | ⬜ | ✗ | ✅ | ⬜ | DCH blind (motion 0.09); PER? real-check ⬜ |
-| 7 | **sustained disturbance** | persistent weather/occlusion | ⬜ | ⬜ | ⬜ | ⬜ | — | ✅ | ✗ | real (block 0.51 vs shuffle 0.03) |
-| 8 | **adversarial** | FGSM/PGD attack | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | **no data, never tested** |
-| 9 | **recovery** | drift returning to normal | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | **never tested** (matters for adapt-stop) |
-| 10 | **very weak disturbance** | severity-1 corruption | ⬜ | ⬜ | ⬜ | ⬜ | — | — | — | only severity-3 tested; detection floor ⬜ |
+**Detection status:**
+- ✅ = experimentally verified on real data (signal present)
+- 🟢 = theoretically expected, **not yet verified** (an expectation, not a fact)
+- 🟡 = verified on **synthetic only** (real test pending)
+- ✗ = tested on real data, **no signal** (and understood why)
+- — = conceptually not applicable (this axis cannot, by construction, see this mechanism)
+- ⬜ = not tested
 
----
+**Why 🟢 vs ✅ matters:** the project's recurring failure is assumptions hardening into
+"facts" (the false-redundancy trap). A cell may NOT be ✅ until a real experiment measured
+it; until then it is at most 🟢. Never silently promote 🟢→✅.
 
-## What's filled, what's not
-
-**Solidly mapped (real-data ✅):**
-- **energy decrease** (corruption/near-OOD) → structure axes (CON/CLD/SUB), confirmed.
-- **directional drift** → DCH (gaussian ramp 0.39, solid).
-- **sustained** → PER (block 0.51 vs shuffle 0.03, rock-solid).
-
-**The empty cells (⬜) — the actual question "what can't we map yet":**
-
-1. **type-b (row 4)** — THE biggest gap. CLD is the only candidate detector and it's
-   *untested on real type-b*. Synthetic always made type-b energy-large (so DEV/CLD both
-   fired = false redundancy). Needs **iSUN** (energy-normal near-OOD for CIFAR-100). Until
-   this runs, we don't know if CLD actually catches real confident-wrong inputs.
-
-2. **non-directional drift (row 6)** — DCH is blind by design (correct). Open question: does
-   PER cover it on real data? If yes, row 6 is fine; if no, it's a real gap needing a new axis.
-
-3. **adversarial (row 8)** — entirely empty. Different mechanism (tiny perturbation, big
-   misclassification). No data (need FGSM/PGD), never tested. May need a new axis.
-
-4. **recovery (row 9)** — entirely empty. Do PER/DCH distinguish "getting worse" from
-   "getting better"? Critical for the adaptation decision (stop adapting if recovering).
-
-5. **energy explosion (row 1)** — synthetic-only. DEV is the designed detector but there's
-   no real stimulus to confirm.
-
-6. **weak disturbance (row 10)** — only severity-3 tested. Where's the detection floor?
-   Does the map hold at severity-1?
-
-**Cross-cutting unknown (affects whether columns collapse):**
-- Are CON/CLD/SUB really 3 axes or 1? **PARTIALLY RESOLVED (run7):** in mixed streams they
-  hit +0.96–0.99, but the common-mode test (within-group correlation) drops this to **+0.60–0.67**
-  — so most of the 0.99 was clean-corrupt common mode, *not* genuine redundancy. However 0.6
-  is still moderate, and on every tested disturbance (corruption, CIFAR-100) all 3 structure
-  axes fire identically (AUC 1.00, split ≤0.15) — they look redundant *on these errors*.
-  **BUT the verdict is not final:** the tested errors are all type-a-like (between-cluster),
-  where all 3 co-fire. The decisive stimulus is **type-b** (wrong-cluster, energy-normal),
-  where CONSENSUS goes silent (votes don't split) but CLUSTER_DISTANCE alone fires — the axes
-  would *split* there. If they split on type-b → keep all 3 (CLD is type-b's unique detector,
-  dropping it = memory#18 false-redundancy trap). If they don't → genuinely redundant, 7→5.
-  **This is why iSUN is decisive: it fills row 4 AND decides the column count.**
+**Confidence (independent of status — how much evidence backs the row's mapping):**
+- HIGH = multiple real-data experiments agree
+- MEDIUM = one real experiment
+- LOW = synthetic only
+- UNKNOWN = not tested
 
 ---
 
-## Roadmap to fill the map (priority order)
+## The Map (strictly mechanism × axis; severity lives in its own matrix below)
 
-1. **iSUN → row 4 (type-b)** + resolve CLD ⊥ DEV. The single highest-value gap. Data:
-   HuggingFace `detectors/isun-ood` (8,925 energy-normal natural scenes).
-2. **structure_redundancy.py → columns 2–4.** Decide if structure axes are 3 or 1 (already
-   built; needs run with `--diag`). Determines the map's column count.
-3. **PER on non-directional drift → row 6.** Does PER cover what DCH misses? (ramp on
-   motion_blur, already have data — just analyze PER there.)
-4. **severity sweep → row 10.** Re-run streams at severity 1,2,3,4,5; find detection floor.
-5. **recovery streams → row 9.** Build a stream that ramps severity UP then DOWN; check if
-   any axis reads the direction.
-6. **adversarial → row 8.** Generate FGSM/PGD on CIFAR-10; test all axes. (New data
-   generation; lower priority — different threat model from the deployment target.)
+Axes: DEV=DEVIATION · CON=CONSENSUS · CLD=CLUSTER_DISTANCE · SUB=SUBNET_CONSENSUS ·
+DCH=DRIFT_COH · PER=PERSIST · CDR=CLUST_DRIFT
 
-**After the map is full:** the empty cells that *remain* after data is available are where
-**new axis candidates** are needed. That's the entry point to systematic add/remove axis
-exploration — a cell no existing axis fills is a new-axis requirement, made precise.
+| # | error mechanism | DEV | CON | CLD | SUB | DCH | PER | CDR | primary metric | confidence |
+|---|-----------------|-----|-----|-----|-----|-----|-----|-----|----------------|------------|
+| 1 | energy explosion | 🟡 | — | — | — | — | — | — | clean-vs-stimulus AUC (energy↑) | LOW |
+| 2 | energy decrease | ✗ | ✅ | ✅ | ✅ | — | — | — | clean-vs-corruption AUC | HIGH |
+| 3 | between-cluster (type-a) | ✗ | ✅ | 🟢 | ✅ | — | — | — | clean-vs-type-a AUC; vote-split rate | MEDIUM |
+| 4 | wrong-cluster (type-b) | ✗ | ✗ | ⬜ | ✗ | — | — | — | correct-vs-confwrong AUC (wrong-center dist) | UNKNOWN |
+| 5 | directional gradual drift | — | — | — | — | ✅ | ✅ | ✗ | ramp vs block (drift coherence) | MEDIUM |
+| 6 | non-directional gradual drift | — | — | — | — | ✗ | 🟢 | ⬜ | ramp(non-dir) vs block; PER streak | LOW |
+| 7 | sustained disturbance | — | — | — | — | — | ✅ | ✗ | block vs shuffle (PERSIST streak) | HIGH |
+| 8 | adversarial | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | clean-vs-FGSM/PGD AUC | UNKNOWN |
+| 9 | recovery (drift returning) | — | — | — | — | 🟢 | 🟢 | ⬜ | return-to-baseline latency / sign | UNKNOWN |
+
+*(Row "very weak disturbance" removed from the mechanism map — that's a severity level, not
+a mechanism. It lives in the Detection-Threshold Matrix below. See taxonomy rules Freeze.)*
 
 ---
 
-## How to read this for add/remove decisions
+## Detection-Threshold Matrix (mechanism × severity — a SEPARATE dimension)
 
-- A **column that's ✗/⬜ everywhere except where another column is also ✅** → redundant axis,
-  drop candidate (this is how CLUST_DRIFT became a drop candidate: never the unique ✅).
-- A **row with no ✅ in any column** → uncovered error → new axis needed.
-- A **column that's the *only* ✅ in some row** → load-bearing axis, never drop (e.g. CLD is
-  the only candidate for row 4; PER is the only ✅ for row 7).
+Difficulty is orthogonal to mechanism. This matrix tracks, per mechanism, the severity at
+which detection holds (escaping the AUC ceiling that saturated everything at severity-3).
 
-This map is the single source of truth for "which axes matter." Update it after every
-real-data run.
+| mechanism | sev1 | sev2 | sev3 | sev4 | sev5 | detection floor |
+|-----------|------|------|------|------|------|-----------------|
+| energy decrease | ⬜ | ⬜ | ✅ | ⬜ | ⬜ | TBD (sev-sweep queued) |
+| between-cluster (type-a) | ⬜ | ⬜ | ✅ | ⬜ | ⬜ | TBD |
+| directional drift | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | only ramp tested, not by severity |
+
+At severity-3 almost all axes hit AUC 1.00 (ceiling) → the floor (lowest severity still
+detected) is unknown. The severity-1 sweep fills this matrix and is where axis *differences*
+become visible (saturation hides them).
+
+---
+
+## Per-Axis Unique Value (the canonical reason to KEEP each axis)
+
+| axis | unique contribution | status of that claim |
+|------|---------------------|----------------------|
+| DEVIATION | only detector for energy *explosion* (one-sided, inflation) | 🟡 synthetic; no real explosion stimulus |
+| CONSENSUS | vote-split / between-cluster (type-a) | ✅ real (but co-fires with CLD/SUB on type-a) |
+| CLUSTER_DISTANCE | **only candidate** for type-b (wrong-cluster) | ⬜ load-bearing IFF it fires on real type-b |
+| SUBNET_CONSENSUS | soft confidence instability (entropy) | ✅ real (entangled with CON/CLD at 0.6) |
+| PERSIST | sustained anomaly over time | ✅ real, solid (block 0.51 vs shuffle 0.03) |
+| DRIFT_COH | directional drift | ✅ real (gaussian ramp 0.39); blind to non-directional |
+| CLUST_DRIFT | unknown — never uniquely separates anything | drop candidate (7→6), pending more error types |
+
+**Rule:** an axis stays only if it has a real ✅ unique contribution OR is the sole candidate
+for an unmapped mechanism (load-bearing). CLD is kept *only* because it's the sole type-b
+candidate — that claim must be tested, not assumed.
+
+---
+
+## Per-Axis Blind Spot (what each axis is expected NOT to detect)
+
+A measurement system is defined as much by its blind spots as its detections.
+
+| axis | expected blind spot | verified? |
+|------|---------------------|-----------|
+| DEVIATION | energy-normal corruption / near-OOD (energy decreases) | ✅ (reads ~0 on corruption, correct) |
+| CONSENSUS | confident wrong-cluster (type-b: votes don't split) | 🟢 expected; confirm on real type-b |
+| CLUSTER_DISTANCE | between-cluster ambiguity if equidistant (small margin) | 🟢 expected (valley geometry) |
+| SUBNET_CONSENSUS | type-b (all subspaces agree on the wrong class) | 🟢 expected |
+| DRIFT_COH | non-directional drift (no consistent direction) | ✅ (motion_blur ramp 0.09, correct) |
+| PERSIST | single transient anomaly (one batch, no streak) | 🟢 expected; confirm |
+| CLUST_DRIFT | (unknown role → unknown blind spot) | ⬜ |
+
+---
+
+## Escalation Rules (this is what makes the map a decision engine)
+
+Read the map, then act:
+
+| condition in the map | required action |
+|----------------------|-----------------|
+| a row has **no ✅/🟢 in any axis** | uncovered mechanism → **propose a new axis** |
+| a cell is **🟡 (synthetic) or 🟢 (theory)** for a load-bearing claim | **prioritize a real-data experiment** to promote or refute it |
+| **multiple axes always co-fire** on every mechanism (no split) | **redundancy investigation** (within-group + split test); collapse if confirmed |
+| **one axis is the sole ✅** in a row | mark **load-bearing**, never drop (CLD for type-b, PER for sustained) |
+| an axis is **never uniquely ✅** anywhere | **drop candidate**; confirm across more mechanisms first (CLUST_DRIFT) |
+| a mechanism is **UNKNOWN confidence** | it's a measurement gap, not a covered cell — schedule it |
+
+---
+
+## Model Generalization (integrates with the Scale Gate)
+
+The map (rows, columns, mechanisms) stays FIXED across models. Only the *filled cells*
+change. Repeat the whole matrix per backbone; divergence between columns is the signal.
+
+| filled for: | ResNet20 | ResNet56 | ViT |
+|-------------|----------|----------|-----|
+| (current state) | in progress | ⬜ | ⬜ |
+
+Pre-commitment: a detection that holds on ResNet20 but breaks on ResNet56/ViT is a
+scale-fragility finding, recorded here — not silently dropped. (Scale-confirmation-bias
+guard: "bigger model = better" is a warning, not validation.)
+
+---
+
+## Freeze: the Error-Mechanism taxonomy is closed by default
+
+Do not casually add rows. A new row must satisfy **all four**:
+1. represents a genuinely different failure *mechanism* (not a phenomenon/dataset);
+2. cannot be expressed as another row **plus severity** (else → Threshold Matrix);
+3. has a plausible deployment scenario;
+4. requires at least one **distinct** detector (else it's covered).
+
+Otherwise it belongs as a severity level, a parameter, or an appendix — not a mechanism row.
+
+*Example application:* "very weak disturbance" failed criterion 2 (it's severity) → moved to
+the Threshold Matrix. "iSUN / far-OOD" is borderline: it's energy-decrease at higher
+magnitude (criterion 2 questionable) → currently folded into row 2, not its own row.
+
+---
+
+## Current honest status (what we actually know vs expect)
+
+- **Verified (✅, real):** energy-decrease→structure axes; directional-drift→DRIFT_COH;
+  sustained→PERSIST. Three solid mappings.
+- **The decisive gap:** row 4 (type-b). CLD is the sole candidate and is ⬜ on real type-b.
+  Everything about the structure-axis column count hinges on it.
+- **Expectations not yet facts (🟢):** every type-b blind-spot claim; recovery behavior;
+  non-directional-drift coverage by PERSIST. These are reasoning, not measurements.
+- **Drop candidate:** CLUST_DRIFT (never uniquely ✅).
+- **Synthetic-only (🟡):** energy-explosion (DEV) — no real stimulus exists yet.
+
+Update this document after every real-data run. Promote 🟢/🟡 → ✅ **only** when a real
+experiment measured it.
