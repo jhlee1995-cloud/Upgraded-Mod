@@ -38,12 +38,12 @@ DCH=DRIFT_COH · PER=PERSIST · CDR=CLUST_DRIFT
 | 1 | energy explosion | 🟡 | — | — | — | — | — | — | clean-vs-stimulus AUC (energy↑) | LOW |
 | 2 | energy decrease | ✗ | ✅ | ✅ | ✅ | — | — | — | clean-vs-corruption AUC | HIGH |
 | 3 | between-cluster (type-a) | ✗ | ✅ | 🟢 | ✅ | — | — | — | clean-vs-type-a AUC; vote-split rate | MEDIUM |
-| 4 | wrong-cluster (type-b) | ✗ | ✗ | ⬜ | ✗ | — | — | — | correct-vs-confwrong AUC (wrong-center dist) | UNKNOWN |
-| 5 | directional gradual drift | — | — | — | — | ✅ | ✅ | ✗ | ramp vs block (drift coherence) | MEDIUM |
-| 6 | non-directional gradual drift | — | — | — | — | ✗ | 🟢 | ⬜ | ramp(non-dir) vs block; PER streak | LOW |
+| 4 | wrong-cluster (type-b) | ✗ | 🟢 | ✅ | 🟢 | — | — | — | per-sample correct-vs-confwrong AUC (margin best 0.895) | MEDIUM |
+| 5 | directional gradual drift | — | — | — | — | ✅ | ✅ | ✗ | ramp vs block (DRIFT_COH sep>1.4) | HIGH |
+| 6 | non-directional gradual drift | — | — | — | — | ✗ | 🟡 | ✗ | ramp vs block; PER covers fog/snow, GAP brightness/defocus/motion | MEDIUM |
 | 7 | sustained disturbance | — | — | — | — | — | ✅ | ✗ | block vs shuffle (PERSIST streak) | HIGH |
 | 8 | adversarial | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | clean-vs-FGSM/PGD AUC | UNKNOWN |
-| 9 | recovery (drift returning) | — | — | — | — | 🟢 | 🟢 | ⬜ | return-to-baseline latency / sign | UNKNOWN |
+| 9 | recovery (drift returning) | — | — | — | — | ✅ | 🟢 | ✗ | recovery vs ramp signed-drift sep 1.99 (DRIFT_COH_signed) | MEDIUM |
 
 *(Row "very weak disturbance" removed from the mechanism map — that's a severity level, not
 a mechanism. It lives in the Detection-Threshold Matrix below. See taxonomy rules Freeze.)*
@@ -55,11 +55,22 @@ a mechanism. It lives in the Detection-Threshold Matrix below. See taxonomy rule
 Difficulty is orthogonal to mechanism. This matrix tracks, per mechanism, the severity at
 which detection holds (escaping the AUC ceiling that saturated everything at severity-3).
 
-| mechanism | sev1 | sev2 | sev3 | sev4 | sev5 | detection floor |
-|-----------|------|------|------|------|------|-----------------|
-| energy decrease | ⬜ | ⬜ | ✅ | ⬜ | ⬜ | TBD (sev-sweep queued) |
-| between-cluster (type-a) | ⬜ | ⬜ | ✅ | ⬜ | ⬜ | TBD |
-| directional drift | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | only ramp tested, not by severity |
+Per-axis detection floor (lowest severity caught, AUC>0.7), from the severity sweep:
+
+| corruption | DEVIATION | CONSENSUS | CLUSTER_DIST | SUBNET_CONS |
+|------------|-----------|-----------|--------------|-------------|
+| brightness | — | — | — | s3 |
+| contrast | s1 | s2 | s2 | s1 |
+| defocus_blur | s2 | s2 | s2 | s2 |
+| fog | s2 | s2 | s3 | s1 |
+| gaussian_noise | s1 | s1 | s1 | s1 |
+| motion_blur | s1 | s1 | s1 | s1 |
+| pixelate | s1 | s1 | s1 | s1 |
+| snow | s1 | s1 | s1 | s1 |
+
+(— = not caught through s3.) **SUBNET_CONSENSUS is the most sensitive axis** (uniquely
+catches brightness; fog/contrast at s1); **CLUSTER_DISTANCE is the least sensitive** (fog only
+at s3). Different floors per axis = direct evidence the axes are NOT redundant.
 
 At severity-3 almost all axes hit AUC 1.00 (ceiling) → the floor (lowest severity still
 detected) is unknown. The severity-1 sweep fills this matrix and is where axis *differences*
@@ -144,6 +155,39 @@ Otherwise it belongs as a severity level, a parameter, or an appendix — not a 
 *Example application:* "very weak disturbance" failed criterion 2 (it's severity) → moved to
 the Threshold Matrix. "iSUN / far-OOD" is borderline: it's energy-decrease at higher
 magnitude (criterion 2 questionable) → currently folded into row 2, not its own row.
+
+---
+
+## Session findings (real-data, this run) — promotions and drops
+
+**Verified facts (✅, promote):**
+- **Valleys exist** in penult: separation ratio 2.87 (ResNet20), 4.12 (ResNet56). Distance
+  axes are well-founded.
+- **Structure axes NOT redundant**: low-severity split (spread 0.32) + distinct detection
+  floors. Keep all 7.
+- **Recovery → DRIFT_COH_signed** (sep 1.99); recovery reverses direction, signed drift reads it.
+- **Directional drift → DRIFT_COH** (sep>1.4 on contrast/gaussian/pixelate).
+- **Sustained → PERSIST** (block vs shuffle sep 2.3–5.8).
+
+**Reframed:**
+- **type-b sits on RIDGES** (small margin 0.535 vs 0.764), not deep in wrong valleys.
+- **VALLEY_MARGIN is the best per-sample type-b detector** (0.895 > CLUSTER_DISTANCE 0.763).
+  Promote it as a candidate axis for per-sample type-b.
+- **Batch-averaging inflates AUC to a 1.00 ceiling** — hides axis differences and true
+  difficulty. Per-sample evaluation is now standard.
+
+**Drops / variants:**
+- **TRAJ_LOOP dropped** — PH on 12-pt trajectories too noisy (sep ~0); DRIFT_COH_signed wins.
+- **CLUST_DRIFT** still a drop candidate (no unique value).
+- **Mahalanobis(CLUSTER_DISTANCE)** — optional variant; helps fog/contrast (+0.11–0.14),
+  not elsewhere.
+
+**Open gap (propose new axis):**
+- **Row 6 non-directional drift** on brightness/defocus/motion — caught weakly by both
+  PERSIST and DRIFT_COH. The clearest new-axis target.
+
+**Scale (ResNet20→56):** picture holds and strengthens; but ResNet56 also has higher accuracy,
+so "improves with scale" needs the without-method control. Solid claim: method does not break.
 
 ---
 
