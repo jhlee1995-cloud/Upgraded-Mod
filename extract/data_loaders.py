@@ -152,6 +152,9 @@ def build_recovery_stream(severity_loaders, clean_loader, n_steps, peak_frac=0.5
             x, _ = next(iters[sevs[lvl - 1]])        # level 1 -> sevs[0]
             plan.append((x, lvl))
     return plan
+
+
+def build_ramp_stream(severity_loaders, n_steps, schedule="linear"):
     """GRADUAL drift stream: severity ramps over the stream (1->5), the proper
     stimulus for DRIFT_COH/CLUST_DRIFT (sustained on/off corruption is NOT gradual).
 
